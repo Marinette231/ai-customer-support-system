@@ -1,116 +1,181 @@
+import os
+import json
+import re
 
-import sqlite3
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from google import genai
 
-# DATABASE CONNECTION
-def connect_db():
-    return sqlite3.connect("support_tickets.db")
+from database import initialize_database, connect_db
+
+# CONFIGURATION
+load_dotenv()
+
+app = FastAPI(
+    title="AI Customer Support System",
+    description="Customer support ticket management with Gemini AI"
+)
+
+initialize_database()
+
+# REQUEST MODELS
+class TicketCreate(BaseModel):
+    customer: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
 
 
-def initialize_database():
+class TicketUpdate(BaseModel):
+    status: str
+    priority: str
+
+# HOME
+@app.get("/")
+def home():
+    return {
+        "message": "Welcome to the AI Customer Support System!"
+    }
+
+
+# VIEW ALL TICKETS
+@app.get("/tickets")
+def get_tickets():
     connection = connect_db()
     cursor = connection.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT NOT NULL,
-            status TEXT DEFAULT 'Open',
-            priority TEXT DEFAULT 'Normal'
-        )
-    """)
+    cursor.execute("SELECT * FROM tickets")
+    tickets = cursor.fetchall()
 
-    connection.commit()
     connection.close()
 
+    return [dict(ticket) for ticket in tickets]
 
-# CUSTOMER FUNCTIONS
-def create_ticket(customer_name):
-    print("\n=== Create Support Ticket ===")
 
-    title = input("Enter ticket title: ").strip()
-    description = input("Describe your problem: ").strip()
-
-    if not title or not description:
-        print("Title and description cannot be empty.")
-        return
-
+# CREATE TICKET
+@app.post("/tickets")
+def create_ticket(ticket: TicketCreate):
     connection = connect_db()
     cursor = connection.cursor()
 
     cursor.execute("""
         INSERT INTO tickets (customer, title, description)
         VALUES (?, ?, ?)
-    """, (customer_name, title, description))
+    """, (
+        ticket.customer.strip(),
+        ticket.title.strip(),
+        ticket.description.strip()
+    ))
 
     ticket_id = cursor.lastrowid
 
     connection.commit()
     connection.close()
 
-    print("\nTicket created successfully!")
-    print("Your Ticket ID:", ticket_id)
+    return {
+        "message": "Ticket created successfully!",
+        "ticket_id": ticket_id
+    }
 
 
-def view_customer_tickets(customer_name):
+# UPDATE TICKET
+@app.put("/tickets/{ticket_id}")
+def update_ticket(ticket_id: int, ticket: TicketUpdate):
+
+    allowed_statuses = [
+        "Open", "In Progress", "Resolved"
+    ]
+
+    allowed_priorities = [
+        "Low", "Normal", "High", "Urgent"
+    ]
+
+    if ticket.status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ticket status"
+        )
+
+    if ticket.priority not in allowed_priorities:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ticket priority"
+        )
+
     connection = connect_db()
     cursor = connection.cursor()
+
+    cursor.execute(
+        "SELECT id FROM tickets WHERE id = ?",
+        (ticket_id,)
+    )
+
+    if cursor.fetchone() is None:
+        connection.close()
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found"
+        )
 
     cursor.execute("""
-        SELECT * FROM tickets WHERE customer = ?
-    """, (customer_name,))
+        UPDATE tickets
+        SET status = ?, priority = ?
+        WHERE id = ?
+    """, (ticket.status, ticket.priority, ticket_id))
 
-    results = cursor.fetchall()
+    connection.commit()
     connection.close()
 
-    print("\n=== My Support Tickets ===")
-
-    if not results:
-        print("No tickets found.")
-        return
-
-    for ticket in results:
-        display_ticket(ticket)
+    return {
+        "message": "Ticket updated successfully!"
+    }
 
 
-# SUPPORT AGENT FUNCTIONS
-def display_ticket(ticket):
-    print("\n-----------------------------")
-    print("Ticket ID:", ticket[0])
-    print("Customer:", ticket[1])
-    print("Title:", ticket[2])
-    print("Description:", ticket[3])
-    print("Status:", ticket[4])
-    print("Priority:", ticket[5])
+# DELETE TICKET
+@app.delete("/tickets/{ticket_id}")
+def delete_ticket(ticket_id: int):
 
-
-def view_all_tickets():
     connection = connect_db()
     cursor = connection.cursor()
 
-    cursor.execute("SELECT * FROM tickets")
+    cursor.execute(
+        "SELECT id FROM tickets WHERE id = ?",
+        (ticket_id,)
+    )
 
-    results = cursor.fetchall()
+    if cursor.fetchone() is None:
+        connection.close()
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found"
+        )
+
+    cursor.execute(
+        "DELETE FROM tickets WHERE id = ?",
+        (ticket_id,)
+    )
+
+    connection.commit()
     connection.close()
 
-    print("\n=== All Support Tickets ===")
-
-    if not results:
-        print("No tickets available.")
-        return
-
-    for ticket in results:
-        display_ticket(ticket)
+    return {
+        "message": "Ticket deleted successfully!"
+    }
 
 
-def update_ticket():
-    try:
-        ticket_id = int(input("\nEnter Ticket ID: "))
-    except ValueError:
-        print("Invalid Ticket ID.")
-        return
+# AI TICKET ANALYSIS
+@app.post("/tickets/{ticket_id}/analyze")
+def analyze_ticket(ticket_id: int):
 
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini API key is not configured."
+        )
+
+    # Get ticket from database
     connection = connect_db()
     cursor = connection.cursor()
 
@@ -122,142 +187,119 @@ def update_ticket():
     ticket = cursor.fetchone()
 
     if ticket is None:
-        print("Ticket not found.")
         connection.close()
-        return
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found"
+        )
 
-    print("\n1. Update Status")
-    print("2. Update Priority")
+    # Prepare the ticket information
+    title = ticket["title"]
+    description = ticket["description"]
 
-    choice = input("Choose an option: ")
+    connection.close()
 
-    if choice == "1":
-        print("\n1. Open")
-        print("2. In Progress")
-        print("3. Resolved")
+    # Connect to Gemini
+    client = genai.Client(api_key=api_key)
 
-        option = input("Select status: ")
+    prompt = f"""
+    You are an AI assistant for a customer support system.
 
-        statuses = {
-            "1": "Open",
-            "2": "In Progress",
-            "3": "Resolved"
-        }
+    Analyze the following customer support ticket.
 
-        if option in statuses:
-            cursor.execute(
-                "UPDATE tickets SET status = ? WHERE id = ?",
-                (statuses[option], ticket_id)
-            )
-            print("Status updated successfully!")
+    Ticket title: {title}
 
-        else:
-            print("Invalid status.")
+    Ticket description: {description}
 
-    elif choice == "2":
-        print("\n1. Low")
-        print("2. Normal")
-        print("3. High")
-        print("4. Urgent")
+    Return ONLY a valid JSON object with these four fields:
 
-        option = input("Select priority: ")
+    {{
+        "category": "One suitable category",
+        "priority": "Low, Normal, High, or Urgent",
+        "sentiment": "Positive, Neutral, or Negative",
+        "suggested_response": "A professional response to the customer"
+    }}
 
-        priorities = {
-            "1": "Low",
-            "2": "Normal",
-            "3": "High",
-            "4": "Urgent"
-        }
+    Rules:
+    - Choose a relevant category such as Payment,
+      Technical Issue, Account, Delivery, or Refund.
+    - Select priority based on the seriousness of the issue.
+    - Keep the suggested response professional and helpful.
+    - Do not claim that a refund or action has already happened.
+    - Do not include markdown code fences.
+    - Return valid JSON only.
+    """
 
-        if option in priorities:
-            cursor.execute(
-                "UPDATE tickets SET priority = ? WHERE id = ?",
-                (priorities[option], ticket_id)
-            )
-            print("Priority updated successfully!")
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=prompt
+        )
 
-        else:
-            print("Invalid priority.")
+        raw_response = response.text
 
-    else:
-        print("Invalid choice.")
+        if not raw_response:
+            raise ValueError("Empty AI response")
+
+        # Removing accidental markdown code fences
+        raw_response = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            raw_response.strip(),
+            flags=re.IGNORECASE
+        )
+
+        result = json.loads(raw_response)
+
+        required_fields = [
+            "category",
+            "priority",
+            "sentiment",
+            "suggested_response"
+        ]
+
+        if not all(field in result for field in required_fields):
+            raise ValueError("Missing AI response fields")
+
+        allowed_priorities = [
+            "Low", "Normal", "High", "Urgent"
+        ]
+
+        if result["priority"] not in allowed_priorities:
+            result["priority"] = "Normal"
+
+    except Exception as e:
+        print("GEMINI ERROR:", repr(e))
+        
+        raise HTTPException(
+        status_code=502,
+        detail=str(e)
+    )
+
+    # Saving AI analysis in SQLite
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        UPDATE tickets
+        SET category = ?,
+            priority = ?,
+            sentiment = ?,
+            ai_suggested_response = ?
+        WHERE id = ?
+    """, (
+        result["category"],
+        result["priority"],
+        result["sentiment"],
+        result["suggested_response"],
+        ticket_id
+    ))
 
     connection.commit()
     connection.close()
 
-
-# CUSTOMER DASHBOARD
-def customer_dashboard():
-    customer_name = input("\nEnter your name: ").strip()
-
-    if not customer_name:
-        print("Name cannot be empty.")
-        return
-
-    while True:
-        print("\n===== CUSTOMER DASHBOARD =====")
-        print("1. Create Ticket")
-        print("2. View My Tickets")
-        print("3. Logout")
-
-        choice = input("Enter choice: ")
-
-        if choice == "1":
-            create_ticket(customer_name)
-
-        elif choice == "2":
-            view_customer_tickets(customer_name)
-
-        elif choice == "3":
-            break
-
-        else:
-            print("Invalid choice.")
-
-
-# SUPPORT AGENT DASHBOARD
-def agent_dashboard():
-    while True:
-        print("\n===== SUPPORT AGENT DASHBOARD =====")
-        print("1. View All Tickets")
-        print("2. Update Ticket")
-        print("3. Logout")
-
-        choice = input("Enter choice: ")
-
-        if choice == "1":
-            view_all_tickets()
-
-        elif choice == "2":
-            update_ticket()
-
-        elif choice == "3":
-            break
-
-        else:
-            print("Invalid choice.")
-
-
-# MAIN PROGRAM
-initialize_database()
-
-while True:
-    print("\n===== CUSTOMER SUPPORT SYSTEM =====")
-    print("1. Customer")
-    print("2. Support Agent")
-    print("3. Exit")
-
-    role = input("Select your role: ")
-
-    if role == "1":
-        customer_dashboard()
-
-    elif role == "2":
-        agent_dashboard()
-
-    elif role == "3":
-        print("Thank you for using our system!")
-        break
-
-    else:
-        print("Invalid choice.")
+    return {
+        "ticket_id": ticket_id,
+        "message": "AI analysis completed successfully!",
+        "analysis": result
+    }
